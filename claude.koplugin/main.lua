@@ -111,7 +111,7 @@ end
 -- callback saves the choice)
 function ClaudePlugin:_providerMenuItems()
     local rows = {}
-    for _, id in ipairs(AIAPI:listProviderIds()) do
+    for _i, id in ipairs(AIAPI:listProviderIds()) do
         local spec = AIAPI:getProvider(id)
         table.insert(rows, {
             text         = _(spec.label),
