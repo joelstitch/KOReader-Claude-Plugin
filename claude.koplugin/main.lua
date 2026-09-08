@@ -1,4 +1,4 @@
--- Claude AI KOReader Plugin
+-- AI Assistant KOReader Plugin (Anthropic Claude / DeepSeek / MiniMax)
 -- Explains highlighted text and provides Q&A about the current book.
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -13,9 +13,16 @@ local Dispatcher      = require("dispatcher")
 local Device          = require("device")
 local logger          = require("logger")
 local _               = require("gettext")
-local ClaudeAPI       = require("claude_api")
+local AIAPI           = require("ai_api")
 
 local Screen = Device.screen
+
+-- Rejects empty/whitespace keys and the config-file placeholder, case-insensitively.
+local function isUsableKey(s)
+    if type(s) ~= "string" then return false end
+    local trimmed = s:gsub("^%s+", ""):gsub("%s+$", "")
+    return trimmed ~= "" and trimmed:upper() ~= "YOUR_API_KEY_HERE"
+end
 
 local ClaudePlugin = WidgetContainer:extend{
     name        = "claude",
@@ -25,33 +32,25 @@ local ClaudePlugin = WidgetContainer:extend{
 -- ── Init ──────────────────────────────────────────────────────────────────────
 
 function ClaudePlugin:init()
-    -- Persistent settings (stores the API key between sessions)
+    -- Persistent settings (stores the provider and API keys between sessions)
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/claude_settings.lua")
-    self.api_key   = self.settings:readSetting("api_key") or ""
+    self.provider  = self:_normalizeProvider(self.settings:readSetting("provider"))
     self.book_text  = nil
     self.book_title = ""
 
-    -- If the API key wasn't set via the UI, try reading claude_config.lua
-    if self.api_key == "" then
-        local cfg_ok, cfg = pcall(require, "claude_config")
-        if cfg_ok and cfg and type(cfg.api_key) == "string"
-                and cfg.api_key ~= "your-api-key-here" and cfg.api_key ~= "" then
-            self.api_key = cfg.api_key
-        end
-    end
-
     -- Register actions users can assign to gestures / hardware buttons
+    -- (IDs stay "claude_*" so existing bindings keep working)
     Dispatcher:registerAction("claude_ask_about_book", {
         category = "none",
         event    = "ClaudeAskAboutBook",
-        title    = _("Claude: Ask about Book"),
+        title    = _("AI: Ask about Book"),
         reader   = true,
     })
     Dispatcher:registerAction("claude_explain_selection", {
         category = "none",
         event    = "ClaudeExplainSelection",
-        title    = _("Claude: Explain Selection"),
+        title    = _("AI: Explain Selection"),
         reader   = true,
     })
 
@@ -62,27 +61,37 @@ end
 
 function ClaudePlugin:addToMainMenu(menu_items)
     menu_items.claude_ai = {
-        text         = _("Claude AI"),
+        text         = _("AI Assistant"),
         sorting_hint = "tools",
         sub_item_table = {
-            -- "Ask Claude" – the main search-like Q&A entry
+            -- "Ask <provider>" – the main search-like Q&A entry
             {
-                text         = _("Ask Claude "),
-                help_text    = _("Ask Claude any question about the book you're reading"),
+                text_func    = function()
+                    return string.format(_("Ask %s"), self:_providerLabel())
+                end,
+                help_text    = _("Ask the AI any question about the book you're reading"),
                 enabled_func = function() return self.ui.document ~= nil end,
                 callback     = function() self:showBookQADialog() end,
             },
             {
                 text         = _("Explain Highlighted Text"),
-                help_text    = _("Get Claude to explain the currently selected text"),
+                help_text    = _("Get the AI to explain the currently selected text"),
                 enabled_func = function() return self.ui.document ~= nil end,
                 callback     = function() self:explainCurrentSelection() end,
             },
             {
-                text         = _("Load Book into Claude"),
-                help_text    = _("Read the full book so Claude can answer detailed questions"),
+                text_func    = function()
+                    return string.format(_("Load Book into %s"), self:_providerLabel())
+                end,
+                help_text    = _("Read the full book so the AI can answer detailed questions"),
                 enabled_func = function() return self.ui.document ~= nil end,
                 callback     = function() self:loadBookText() end,
+            },
+            {
+                text_func = function()
+                    return _("AI Provider: ") .. self:_providerLabel()
+                end,
+                sub_item_table = self:_providerMenuItems(),
             },
             {   -- visual separator
                 text             = _("──────────────"),
@@ -98,6 +107,28 @@ function ClaudePlugin:addToMainMenu(menu_items)
     }
 end
 
+-- Radio-style provider picker (KOReader pattern: checked_func shows the tick,
+-- callback saves the choice)
+function ClaudePlugin:_providerMenuItems()
+    local rows = {}
+    for _, id in ipairs(AIAPI:listProviderIds()) do
+        local spec = AIAPI:getProvider(id)
+        table.insert(rows, {
+            text         = _(spec.label),
+            checked_func = function() return self.provider == id end,
+            callback     = function(touchmenu_instance)
+                self.provider = id
+                self.settings:saveSetting("provider", id)
+                self.settings:flush()
+                if touchmenu_instance and touchmenu_instance.updateItems then
+                    touchmenu_instance:updateItems()
+                end
+            end,
+        })
+    end
+    return rows
+end
+
 -- ── Reader events ─────────────────────────────────────────────────────────────
 
 function ClaudePlugin:onReaderReady()
@@ -111,7 +142,7 @@ function ClaudePlugin:onReaderReady()
         end
     end
 
-    -- Try to inject an "Ask Claude" button into the text-selection popup.
+    -- Try to inject an "Ask <provider>" button into the text-selection popup.
     -- addToHighlightDialog is available in KOReader 2023+; we wrap in pcall
     -- so older builds simply skip this and users rely on the menu instead.
     if self.ui.highlight and self.ui.highlight.addToHighlightDialog then
@@ -120,7 +151,7 @@ function ClaudePlugin:onReaderReady()
                 "claude_explain",
                 function(dlg)
                     return {
-                        text     = _("Ask Claude"),
+                        text     = string.format(_("Ask %s"), self:_providerLabel()),
                         callback = function()
                             local text = ""
                             if dlg.selected_text then
@@ -165,7 +196,8 @@ end
 function ClaudePlugin:explainText(text)
     if not self:checkApiKey() then return end
 
-    local loading = InfoMessage:new{ text = _("Asking Claude…") }
+    local label   = self:_providerLabel()
+    local loading = InfoMessage:new{ text = string.format(_("Asking %s…"), label) }
     UIManager:show(loading)
 
     local system_prompt = [[You are a reading assistant inside an e-reader application.
@@ -177,8 +209,9 @@ When the user highlights text from their book, identify what it is and respond c
 • A passage or quote         → explain meaning and context
 Keep your answer under 150 words. Do not repeat the highlighted text at the start of your reply.]]
 
-    local ok, response = ClaudeAPI:query(
-        self.api_key,
+    local ok, response = AIAPI:query(
+        self.provider,
+        self:_providerKey(),
         system_prompt,
         'Explain this text from the book I\'m reading: "' .. text .. '"'
     )
@@ -186,14 +219,14 @@ Keep your answer under 150 words. Do not repeat the highlighted text at the star
 
     if ok then
         UIManager:show(TextViewer:new{
-            title  = _("Claude AI"),
+            title  = label,
             text   = "\226\128\156" .. text .. "\226\128\157\n\n" .. response,
             height = math.floor(Screen:getHeight() * 0.72),
             width  = math.floor(Screen:getWidth()  * 0.92),
         })
     else
         UIManager:show(InfoMessage:new{
-            text    = _("Claude error: ") .. response,
+            text    = label .. _(" error: ") .. response,
             timeout = 5,
         })
     end
@@ -206,13 +239,16 @@ function ClaudePlugin:loadBookText()
 
     local page_count = self.ui.document:getPageCount()
     UIManager:show(InfoMessage:new{
-        text    = string.format(_("Loading %d pages into Claude context…"), page_count),
+        text    = string.format(_("Loading %d pages into %s context…"),
+                                page_count, self:_providerLabel()),
         timeout = 2,
     })
 
     local parts     = {}
     local total_len = 0
-    local MAX_CHARS = 150000   -- ~37 K tokens – fits comfortably in Claude's window
+    local max_bytes = self:_bookMaxBytes()
+    -- #text counts bytes, not characters – intentional: byte caps bound the
+    -- token count consistently across scripts (CJK is ~3 bytes per character).
 
     for page = 1, page_count do
         local ok, text = pcall(function()
@@ -222,7 +258,7 @@ function ClaudePlugin:loadBookText()
             table.insert(parts, text)
             total_len = total_len + #text
         end
-        if total_len >= MAX_CHARS then
+        if total_len >= max_bytes then
             table.insert(parts, string.format(
                 "\n\n[Book truncated at page %d of %d to fit context window]",
                 page, page_count))
@@ -234,8 +270,8 @@ function ClaudePlugin:loadBookText()
 
     UIManager:show(InfoMessage:new{
         text    = string.format(
-            _("Book loaded! %d characters ready.\nNow use 'Ask Claude' to ask questions."),
-            #self.book_text),
+            _("Book loaded! %d bytes of text ready.\nNow use 'Ask %s' to ask questions."),
+            #self.book_text, self:_providerLabel()),
         timeout = 4,
     })
 end
@@ -250,9 +286,10 @@ function ClaudePlugin:showBookQADialog()
     else
         UIManager:show(ConfirmBox:new{
             text = _(
-                "Load the full book first so Claude can give accurate answers?\n\n"
-                .. "Tap 'Load Book' to read it now, or 'Skip' to ask using "
-                .. "Claude's general knowledge."),
+                "Load the full book first so the AI can give accurate answers?\n\n"
+                .. "Tap 'Load Book' to read it now, or 'Skip' to ask using ")
+                .. self:_providerLabel()
+                .. _("'s general knowledge."),
             ok_text     = _("Load Book"),
             cancel_text = _("Skip"),
             ok_callback = function()
@@ -270,7 +307,7 @@ function ClaudePlugin:_showQAInput()
     local display_title = (self.book_title ~= "") and self.book_title or _("current book")
     local dialog
     dialog = InputDialog:new{
-        title       = _("Ask Claude 🔍"),
+        title       = string.format(_("Ask %s 🔍"), self:_providerLabel()),
         description = _("Book: ") .. display_title,
         input_hint  = _("e.g. Who is the main character? What happens in chapter 3?"),
         buttons = {
@@ -296,7 +333,8 @@ function ClaudePlugin:_showQAInput()
 end
 
 function ClaudePlugin:askAboutBook(question)
-    local loading = InfoMessage:new{ text = _("Asking Claude…") }
+    local label   = self:_providerLabel()
+    local loading = InfoMessage:new{ text = string.format(_("Asking %s…"), label) }
     UIManager:show(loading)
 
     local title = (self.book_title ~= "") and self.book_title or "the book"
@@ -309,7 +347,7 @@ function ClaudePlugin:askAboutBook(question)
             .. 'Answer questions accurately based on the book content. '
             .. 'Cite specific details or passages when relevant.',
             title,
-            self.book_text:sub(1, 150000))
+            self.book_text:sub(1, self:_bookMaxBytes()))
     else
         system_prompt = string.format(
             'You are a helpful reading assistant. '
@@ -319,12 +357,12 @@ function ClaudePlugin:askAboutBook(question)
             title)
     end
 
-    local ok, response = ClaudeAPI:query(self.api_key, system_prompt, question)
+    local ok, response = AIAPI:query(self.provider, self:_providerKey(), system_prompt, question)
     UIManager:close(loading)
 
     if ok then
         UIManager:show(TextViewer:new{
-            title  = _("Claude"),
+            title  = label,
             text   = "Q: " .. question .. "\n\n" .. response,
             height = math.floor(Screen:getHeight() * 0.82),
             width  = math.floor(Screen:getWidth()  * 0.92),
@@ -340,11 +378,14 @@ end
 -- ── API-key settings dialog ───────────────────────────────────────────────────
 
 function ClaudePlugin:showApiKeyDialog()
+    local spec  = AIAPI:getProvider(self.provider)
+    local label = self:_providerLabel()
     local dialog
     dialog = InputDialog:new{
-        title       = _("Claude API Key"),
-        description = _("Get your key at: console.anthropic.com\nOr edit claude_config.lua in the plugin folder."),
-        input       = self.api_key,
+        title       = label .. _(" API Key"),
+        description = _("Get your key at: ") .. (spec and spec.key_url or "")
+                   .. _("\nOr edit claude_config.lua in the plugin folder."),
+        input       = self:_providerKey(),
         input_type  = "string",
         buttons = {
             {
@@ -358,12 +399,11 @@ function ClaudePlugin:showApiKeyDialog()
                     callback         = function()
                         local key = dialog:getInputText()
                         UIManager:close(dialog)
-                        if key and key ~= "" then
-                            self.api_key = key
-                            self.settings:saveSetting("api_key", key)
+                        if isUsableKey(key) then
+                            self.settings:saveSetting(spec.key_setting, key)
                             self.settings:flush()
                             UIManager:show(InfoMessage:new{
-                                text    = _("API key saved!"),
+                                text    = string.format(_("%s API key saved!"), label),
                                 timeout = 2,
                             })
                         end
@@ -374,6 +414,43 @@ function ClaudePlugin:showApiKeyDialog()
     }
     UIManager:show(dialog)
     dialog:onShowKeyboard()
+end
+
+-- ── Provider state ────────────────────────────────────────────────────────────
+
+-- Keys are read lazily: LuaSettings (saved from the UI) wins,
+-- claude_config.lua is the fallback. Placeholders are rejected (isUsableKey).
+function ClaudePlugin:_providerKey()
+    local spec = AIAPI:getProvider(self.provider)
+    if not spec then return "" end
+    local key = self.settings:readSetting(spec.key_setting) or ""
+    if not isUsableKey(key) then
+        local cfg_ok, cfg = pcall(require, "claude_config")
+        if cfg_ok and cfg and type(cfg) == "table" then
+            local cand = cfg[spec.key_setting]
+            if isUsableKey(cand) then key = cand end
+        end
+    end
+    return key
+end
+
+function ClaudePlugin:_providerLabel()
+    return AIAPI:getLabel(self.provider)
+end
+
+function ClaudePlugin:_bookMaxBytes()
+    local spec = AIAPI:getProvider(self.provider)
+    return spec and spec.max_bytes or 150000
+end
+
+-- Unknown/empty provider ids fall back to Anthropic and repair the stored setting.
+function ClaudePlugin:_normalizeProvider(id)
+    if AIAPI:getProvider(id) then return id end
+    if self.settings then
+        self.settings:saveSetting("provider", "anthropic")
+        self.settings:flush()
+    end
+    return "anthropic"
 end
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
@@ -388,14 +465,16 @@ function ClaudePlugin:_getSelectedText()
 end
 
 function ClaudePlugin:checkApiKey()
-    if not self.api_key or self.api_key == "" then
-        UIManager:show(InfoMessage:new{
-            text    = _("Claude AI: no API key configured.\nMenu → Claude AI → Configure API Key"),
-            timeout = 4,
-        })
-        return false
+    if isUsableKey(self:_providerKey()) then
+        return true
     end
-    return true
+    UIManager:show(InfoMessage:new{
+        text    = self:_providerLabel()
+               .. _(": no API key configured.\nTools → AI Assistant → AI Provider to switch, ")
+               .. _("or Configure API Key to add one."),
+        timeout = 4,
+    })
+    return false
 end
 
 return ClaudePlugin

@@ -1,6 +1,7 @@
 return {
     name        = "claude",
-    fullname    = "Claude AI Assistant",
-    description = "Explains highlighted words/names, translates text, and answers questions about books using Anthropic's Claude AI.",
-    version     = "1.0.0",
+    fullname    = "AI Reading Assistant",
+    description = "Explains highlighted words/names, translates text, and answers questions "
+        .. "about books using Anthropic Claude, DeepSeek or MiniMax AI.",
+    version     = "1.1.0",
 }
